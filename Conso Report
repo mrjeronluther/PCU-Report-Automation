@@ -1,0 +1,511 @@
+/**
+ * Main function the user runs. This version includes a standardized pre-flight check algorithm for maximum reliability.
+ */
+function uisadaaa() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ui = SpreadsheetApp.getUi();
+    const scriptProperties = PropertiesService.getScriptProperties();
+
+    try {
+        const mainProcessor = new ReportProcessor(ss, scriptProperties);
+
+        // Run a comprehensive check of all prerequisites before processing.
+        const checks = mainProcessor.runPreFlightChecks();
+        if (!checks.passed) {
+            ui.alert("Pre-Flight Check Failed", checks.message, ui.ButtonSet.OK);
+            return;
+        }
+
+        const { sourceFilesData } = checks;
+        
+        // Safely parse the 'processedFiles' property to avoid errors from corrupt state.
+        const processedFilesStr = scriptProperties.getProperty("processedFiles");
+        let processedFiles = [];
+        if (processedFilesStr) {
+            try {
+                processedFiles = JSON.parse(processedFilesStr);
+            } catch (e) {
+                Logger.log(`WARNING: Could not parse 'processedFiles'. Resetting list. Error: ${e.message}`);
+                processedFiles = [];
+            }
+        }
+        
+        const filesToProcess = sourceFilesData.filter((row) => {
+            const fileName = row[0];
+            return (
+                fileName && fileName.toString().trim() !== "" && !processedFiles.includes(fileName.toString().trim())
+            );
+        });
+
+        if (filesToProcess.length === 0) {
+            ui.alert(
+                "All files have been processed.",
+                "To re-run all files, the script properties will be cleared. You can run the script again after this message.",
+                ui.ButtonSet.OK
+            );
+            scriptProperties.deleteProperty("processedFiles");
+            return;
+        }
+
+        mainProcessor.processFiles(filesToProcess, processedFiles, checks.consoAllData, checks.consoColIndex);
+
+    } catch (e) {
+        const errorMessage = `An unexpected error occurred: ${e.message}.`;
+        Logger.log(`FATAL ERROR in uiaaa: ${e.stack}`);
+        ui.alert(errorMessage, "Check the script execution logs (View -> Logs) for more details.", ui.ButtonSet.OK);
+    }
+}
+
+/**
+ * A class to encapsulate all report generation logic.
+ */
+class ReportProcessor {
+    constructor(spreadsheet, properties) {
+        this.ss = spreadsheet;
+        this.scriptProperties = properties;
+        this.ui = SpreadsheetApp.getUi();
+        this.startTime = new Date();
+        this.TIMEOUT_THRESHOLD_MS = 5.5 * 60 * 1000;
+
+        // --- CONFIGURATION ---
+        this.MASTER_EXTENSION_URL = "https://docs.google.com/spreadsheets/d/1mqg-5THBoUXAT3Hxz1fgdUyx1QWKiuW2YvL8op4PnVI/edit";
+        this.ARCHIVE_FOLDER_ID = "1obQ4LmNQflZnDcxgQgG7I8tcUffNdDOJ";
+        this.MAX_ROWS_PER_SHEET = 400000; //400000
+        this.ARCHIVE_BASE_NAME = "Consolidated Report"; // <-- UPDATED NAME
+
+        // Step 1: Define all necessary names
+        this.columnNames = {
+            // Core Fields from source data
+            fileName: "File Name", contractAmount: "Contract Amount", rfpAmount: "SOA AMOUNT",
+            status: "GENERAL STATUS", service: "KINDS OF SERVICE", year: "YEAR", property: "Property",
+            supplier: "PAYEE NAME", payor: "PAYOR NAME",
+
+            // --- NEW COLUMNS FOR DEDUPLICATION (REVISION) ---
+            tabName: "Tab Name", // Note: This must be a column in your 'Conso' data
+            month: "MONTH",
+            sector: "Sector",
+            contractNo: "CONTRACT NO",
+            invoiceNo: "INVOICE NO.",
+            // --- END OF NEW COLUMNS ---
+
+            // Raw Statuses from the "GENERAL STATUS" column
+            statusPaid: "PAID", statusRtAdmin: "RT ADMIN | COMPLIANCE", statusRtSupplier: "RT SUPPLIER | COMPLIANCE",
+            statusOnHand: "ON HAND", statusWithAcctg: "WITH ACCTG", statusNoBilling: "NO BILLING",
+            statusWithTk: "WITH TK", statusRtProc: "RT PROC | COMPLIANCE",
+
+            // New, clean Report Headers
+            reportPaid: "PAID", reportWithAdmin: "WITH ADMIN", reportWithSupplier: "WITH SUPPLIER",
+            reportWithPcu: "WITH PCU", reportWithAcctg: "WITH ACCTG", reportNoBilling: "NO BILLING",
+            reportWithTk: "WITH TK",
+        };
+        
+        this.tabNameMapping = {
+            "MANPOWER SERVICES": "MSPdash", "PROJECTS": "PROJdash", "PM AFFILIATES": "PMAdash",
+            "OPS CONTRACTED SERVICES": "OCSlash", "MARKETING SERVICES": "MSdash",
+        };
+
+        // Step 2: Create the mapping from the RAW status to the desired REPORT header.
+        this.statusReportMapping = {
+            [this.columnNames.statusPaid]: this.columnNames.reportPaid,
+            [this.columnNames.statusRtAdmin]: this.columnNames.reportWithAdmin,
+            [this.columnNames.statusRtProc]: this.columnNames.reportWithAdmin, // Groups this into "WITH ADMIN"
+            [this.columnNames.statusRtSupplier]: this.columnNames.reportWithSupplier,
+            [this.columnNames.statusOnHand]: this.columnNames.reportWithPcu,
+            [this.columnNames.statusWithAcctg]: this.columnNames.reportWithAcctg,
+            [this.columnNames.statusNoBilling]: this.columnNames.reportNoBilling,
+            [this.columnNames.statusWithTk]: this.columnNames.reportWithTk,
+        };
+
+        // Step 3: Define the EXACT, clean list of headers for the final report.
+        this.FINANCIAL_HEADERS = [
+            this.columnNames.reportPaid,
+            this.columnNames.reportWithAdmin,
+            this.columnNames.reportWithSupplier,
+            this.columnNames.reportWithPcu,
+            this.columnNames.reportWithAcctg,
+            this.columnNames.reportNoBilling,
+            this.columnNames.reportWithTk,
+        ];
+        
+        this.statusMap = this._createStatusMap();
+    }
+
+    _createStatusMap() {
+        const map = new Map();
+        const allRawStatuses = Object.keys(this.statusReportMapping);
+        for (const status of allRawStatuses) {
+            if (typeof status !== 'string') continue;
+            const normalizedKey = status.toLowerCase().replace(/[^a-z0-9]/g, '');
+            map.set(normalizedKey, status);
+        }
+        return map;
+    }
+    
+    _getCanonicalStatus(rawStatus) {
+        if (!rawStatus || typeof rawStatus !== 'string' || rawStatus.trim() === "") return null;
+        const normalized = rawStatus.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return this.statusMap.get(normalized) || null;
+    }
+    
+    runPreFlightChecks() {
+        Logger.log("--- Starting Pre-Flight Checks ---");
+        try {
+            DriveApp.getFolderById(this.ARCHIVE_FOLDER_ID);
+            SpreadsheetApp.openByUrl(this.MASTER_EXTENSION_URL);
+        } catch (e) {
+            return { passed: false, message: `Cannot access required resources. Check ARCHIVE_FOLDER_ID and MASTER_EXTENSION_URL. Error: ${e.message}` };
+        }
+        const sourceFilesSheet = this.ss.getSheetByName("SOURCEFILES");
+        if (!sourceFilesSheet) return { passed: false, message: "Critical Error: 'SOURCEFILES' tab not found." };
+        const lastRow = sourceFilesSheet.getLastRow();
+        if (lastRow < 2) return { passed: false, message: "No data in 'SOURCEFILES' tab to process." };
+        const sourceFilesData = sourceFilesSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+        if (sourceFilesData.every(row => !row[0] || row[0].toString().trim() === "")) {
+            return { passed: false, message: "No files listed in 'SOURCEFILES' tab to process." };
+        }
+        const { consoAllData, consoHeaderRow } = this.getAllConsoData();
+        if (!consoHeaderRow) return { passed: false, message: "Data Collection Failed: No header row found in any 'Conso' tab." };
+        if (consoAllData.length === 0) return { passed: false, message: "No Data Found in any 'Conso' tab." };
+        const consoColIndex = this._validateAndMapHeaders(consoHeaderRow);
+        if (!consoColIndex) return { passed: false, message: "Your 'Conso' data is missing required columns. Check logs for details." };
+        const uniqueConsoData = this._deduplicateConsoData(consoAllData, consoColIndex);
+        Logger.log("--- Pre-Flight Checks Passed Successfully ---");
+        return { passed: true, sourceFilesData, consoAllData: uniqueConsoData, consoColIndex };
+    }
+
+    _normalizeString(str) { return typeof str === "string" ? str.toLowerCase().replace(/[\s-_]/g, "") : ""; }
+    
+    _getNumericValue(row, colIndexMap, headerName) {
+        const index = colIndexMap[headerName];
+        if (index === undefined) return 0;
+        let value = row[index];
+        if (typeof value === 'number') return isNaN(value) ? 0 : value;
+        if (typeof value === 'string') return parseFloat(value.replace(/[^0-9.-]/g, "")) || 0;
+        return 0;
+    }
+
+    _getStringValue(row, colIndexMap, headerName) {
+        const index = colIndexMap[headerName];
+        if (index === undefined) return "N/A";
+        const value = row[index];
+        return value === null || value === undefined || String(value).trim() === "" ? "N/A" : String(value).trim();
+    }
+
+    _validateAndMapHeaders(consoHeaderRow) {
+        const requiredHeaders = [
+            this.columnNames.fileName, this.columnNames.contractAmount, this.columnNames.rfpAmount, 
+            this.columnNames.status, this.columnNames.service, this.columnNames.year, 
+            this.columnNames.property, this.columnNames.supplier, this.columnNames.payor,
+            this.columnNames.tabName, this.columnNames.month, this.columnNames.sector,
+            this.columnNames.contractNo, this.columnNames.invoiceNo
+        ];
+        const normalizedSheetHeaders = consoHeaderRow.map(h => h.toString().trim().toLowerCase());
+        const headerMap = {};
+        let missingHeaders = [];
+        requiredHeaders.forEach(header => {
+            const index = normalizedSheetHeaders.indexOf(header.trim().toLowerCase());
+            if (index !== -1) {
+                headerMap[header] = index;
+            } else {
+                missingHeaders.push(header);
+            }
+        });
+        if (missingHeaders.length > 0) {
+            Logger.log(`Critical Error: 'Conso' data is missing columns: [${missingHeaders.join(", ")}].`);
+            return null;
+        }
+        return headerMap;
+    }
+
+    getAllConsoData() {
+        Logger.log("--- Starting Data Collection ---");
+        let allDataBlocks = [], visitedIds = {};
+        this.recursivelyGetAllDataBlocks(this.ss, allDataBlocks, visitedIds);
+        try {
+            const masterSS = SpreadsheetApp.openByUrl(this.MASTER_EXTENSION_URL);
+            const masterExtensionSheet = masterSS.getSheetByName("Extension Tabs");
+            if (masterExtensionSheet) {
+                const urls = masterExtensionSheet.getRange("B2:B" + masterExtensionSheet.getLastRow()).getValues().flat().filter((url) => url.trim() !== "");
+                urls.forEach((url) => {
+                    try {
+                        const nextSpreadsheet = SpreadsheetApp.openByUrl(url);
+                        this.recursivelyGetAllDataBlocks(nextSpreadsheet, allDataBlocks, visitedIds);
+                    } catch (e) {
+                        Logger.log(`ERROR: Could not open spreadsheet from URL: ${url}. Skipping. Error: ${e.message}`);
+                    }
+                });
+            }
+        } catch (e) {
+            Logger.log(`FATAL ERROR: Could not open Master Control File. URL: ${this.MASTER_EXTENSION_URL}. Error: ${e.message}`);
+        }
+        let finalCombinedData = [], finalHeaderRow = null;
+        allDataBlocks.forEach((block) => {
+            if (block.length === 0) return;
+            const header = block.shift();
+            if (!finalHeaderRow) finalHeaderRow = header;
+            finalCombinedData = finalCombinedData.concat(block);
+        });
+        Logger.log(`--- Data Collection Finished. Total raw rows: ${finalCombinedData.length} ---`);
+        return { consoAllData: finalCombinedData, consoHeaderRow: finalHeaderRow };
+    }
+    
+    recursivelyGetAllDataBlocks(spreadsheet, allDataBlocks, visitedIds) {
+        const spreadsheetId = spreadsheet.getId();
+        if (visitedIds[spreadsheetId]) return;
+        visitedIds[spreadsheetId] = true;
+        Logger.log(`Processing spreadsheet: "${spreadsheet.getName()}"`);
+        const consoSheet = spreadsheet.getSheetByName("Conso");
+        if (consoSheet) {
+            const data = consoSheet.getDataRange().getValues();
+            if (data.length > 0) allDataBlocks.push(data);
+        }
+        const extensionSheet = spreadsheet.getSheetByName("Extension Tabs");
+        if (extensionSheet) {
+            const urls = extensionSheet.getRange("B2:B" + extensionSheet.getLastRow()).getValues().flat().filter((url) => url.trim() !== "");
+            urls.forEach((url) => {
+                try {
+                    const nextSpreadsheet = SpreadsheetApp.openByUrl(url);
+                    this.recursivelyGetAllDataBlocks(nextSpreadsheet, allDataBlocks, visitedIds);
+                } catch (e) {
+                    Logger.log(`ERROR: Could not open chained URL: ${url}. Error: ${e.message}`);
+                }
+            });
+        }
+    }
+    
+    _deduplicateConsoData(consoAllData, colIndexMap) {
+        const latestRecordsMap = new Map();
+        Logger.log(`Starting deduplication on ${consoAllData.length} raw rows.`);
+        consoAllData.forEach((row) => {
+            const fileName = this._getStringValue(row, colIndexMap, this.columnNames.fileName);
+            const tabName = this._getStringValue(row, colIndexMap, this.columnNames.tabName);
+            const year = this._getStringValue(row, colIndexMap, this.columnNames.year);
+            const month = this._getStringValue(row, colIndexMap, this.columnNames.month);
+            const property = this._getStringValue(row, colIndexMap, this.columnNames.property);
+            const payor = this._getStringValue(row, colIndexMap, this.columnNames.payor);
+            const supplier = this._getStringValue(row, colIndexMap, this.columnNames.supplier);
+            const sector = this._getStringValue(row, colIndexMap, this.columnNames.sector);
+            const service = this._getStringValue(row, colIndexMap, this.columnNames.service);
+            const contractNo = this._getStringValue(row, colIndexMap, this.columnNames.contractNo);
+            const contractAmount = this._getNumericValue(row, colIndexMap, this.columnNames.contractAmount);
+            const invoiceNo = this._getStringValue(row, colIndexMap, this.columnNames.invoiceNo);
+            const uniqueKey = [fileName, tabName, year, month, property, payor, supplier, sector, service, contractNo, contractAmount, invoiceNo].join('|').toLowerCase();
+            if (uniqueKey === "n/a|n/a|n/a|n/a|n/a|n/a|n/a|n/a|n/a|n/a|0|n/a") return;
+            latestRecordsMap.set(uniqueKey, row);
+        });
+        const deduplicatedData = Array.from(latestRecordsMap.values());
+        Logger.log(`Deduplication complete. Reduced to ${deduplicatedData.length} unique rows.`);
+        return deduplicatedData;
+    }
+    
+    processFiles(filesToProcess, previouslyProcessedFiles, consoAllData, consoColIndex) {
+        try {
+            let aggregatedDataForRun = {}, processedFilesInThisRun = [], skippedFilesCount = 0;
+            for (const sourceRow of filesToProcess) {
+                const fileName = (sourceRow[0] || "").toString().trim();
+                if (fileName === "") continue;
+                const destName = (sourceRow[3] || "").toString().trim();
+                const targetTabName = this.tabNameMapping[destName] || destName;
+                if (!targetTabName) {
+                    skippedFilesCount++;
+                    processedFilesInThisRun.push(fileName);
+                    continue;
+                }
+                if (!aggregatedDataForRun[targetTabName]) {
+                    aggregatedDataForRun[targetTabName] = { reportByServiceYear: {}, reportByServiceProperty: {}, reportByServiceSupplier: {}, reportByServicePayor: {} };
+                }
+                if (!this.aggregateDataFromFile(fileName, consoAllData, consoColIndex, aggregatedDataForRun[targetTabName])) {
+                    skippedFilesCount++;
+                }
+                processedFilesInThisRun.push(fileName);
+                if (new Date() - this.startTime > this.TIMEOUT_THRESHOLD_MS) {
+                    this.writeAggregatedDataToSheets(aggregatedDataForRun);
+                    this.scriptProperties.setProperty("processedFiles", JSON.stringify(previouslyProcessedFiles.concat(processedFilesInThisRun)));
+                    this.ui.alert("Execution Paused", "Progress saved. Please run the script again to continue.", this.ui.ButtonSet.OK);
+                    return;
+                }
+            }
+            this.writeAggregatedDataToSheets(aggregatedDataForRun);
+            this.scriptProperties.deleteProperty("processedFiles");
+            this.ui.alert("Report Complete", `Success! Processed ${filesToProcess.length - skippedFilesCount} files.`, this.ui.ButtonSet.OK);
+        } catch (e) {
+            Logger.log(`ERROR in processFiles: ${e.stack}`);
+            this.ui.alert("Processing Error", `An error occurred: ${e.message}`, this.ui.ButtonSet.OK);
+        }
+    }
+
+    aggregateDataFromFile(fileName, consoAllData, consoColIndex, dataForTab) {
+        const normalizedSourceFileName = this._normalizeString(fileName);
+        const matchedConsoRows = consoAllData.filter(row => this._normalizeString(this._getStringValue(row, consoColIndex, this.columnNames.fileName)).includes(normalizedSourceFileName));
+        if (matchedConsoRows.length === 0) return false;
+        matchedConsoRows.forEach(consoRow => {
+            const rfpAmt = this._getNumericValue(consoRow, consoColIndex, this.columnNames.rfpAmount);
+            const rawStatus = this._getStringValue(consoRow, consoColIndex, this.columnNames.status);
+            const canonicalStatus = this._getCanonicalStatus(rawStatus);
+            const reportColumn = this.statusReportMapping[canonicalStatus];
+            const service = this._getStringValue(consoRow, consoColIndex, this.columnNames.service);
+            const year = this._getStringValue(consoRow, consoColIndex, this.columnNames.year);
+            const property = this._getStringValue(consoRow, consoColIndex, this.columnNames.property);
+            const supplier = this._getStringValue(consoRow, consoColIndex, this.columnNames.supplier);
+            const payor = this._getStringValue(consoRow, consoColIndex, this.columnNames.payor);
+            const updateRow = (reportObject, key, pField, pValue, sField, sValue) => {
+                if (!reportObject[key]) {
+                    reportObject[key] = { [pField]: pValue };
+                    if (sField) reportObject[key][sField] = sValue;
+                    this.FINANCIAL_HEADERS.forEach(h => (reportObject[key][h] = 0));
+                }
+                if (reportColumn && reportObject[key].hasOwnProperty(reportColumn)) {
+                     reportObject[key][reportColumn] += rfpAmt;
+                }
+            };
+            updateRow(dataForTab.reportByServiceYear, `${service}_${year}`, this.columnNames.service, service, this.columnNames.year, year);
+            updateRow(dataForTab.reportByServiceProperty, `${service}_${property}`, this.columnNames.service, service, this.columnNames.property, property);
+            updateRow(dataForTab.reportByServiceSupplier, `${service}_${supplier}`, this.columnNames.service, service, this.columnNames.supplier, supplier);
+            updateRow(dataForTab.reportByServicePayor, `${service}_${payor}`, this.columnNames.service, service, this.columnNames.payor, payor);
+        });
+        return true;
+    }
+
+    writeAggregatedDataToSheets(aggregatedDataForRun) {
+        for (const targetTabName in aggregatedDataForRun) {
+            const dataForTab = aggregatedDataForRun[targetTabName];
+            const rowsToAdd = this._calculateRowsForBlock(dataForTab);
+            const targetSheet = this._getOrCreateDestinationSheet(targetTabName, rowsToAdd);
+            if (!targetSheet) continue;
+            let currentRow = targetSheet.getLastRow() > 0 ? targetSheet.getLastRow() + 2 : 1;
+            const formattedDateTime = Utilities.formatDate(new Date(), this.ss.getSpreadsheetTimeZone(), "MMMM dd, yyyy, h:mm a");
+            targetSheet.getRange(currentRow, 1, 1, 5).setValue(`As of ${formattedDateTime}`).setFontWeight("bold").merge();
+            currentRow += 2;
+            const writeReportBlock = (title, primaryHeaders, data, sortField, isNumericSort = false, isAscending = true) => {
+                if (!data) return;
+                const allHeaders = primaryHeaders.concat(this.FINANCIAL_HEADERS);
+                targetSheet.getRange(currentRow, 1, 1, allHeaders.length).setValue(title).setFontWeight("bold").merge();
+                currentRow++;
+                targetSheet.getRange(currentRow, 1, 1, allHeaders.length).setValues([allHeaders]).setFontWeight("bold");
+                currentRow++;
+                if (Object.keys(data).length > 0) {
+                    let dataToSort = Object.values(data);
+                    if (title === "Summary by Service and Year") {
+                        dataToSort.sort((a, b) => {
+                            const serviceA = a[this.columnNames.service];
+                            const serviceB = b[this.columnNames.service];
+                            const serviceCompare = String(serviceA).localeCompare(String(serviceB));
+                            if (serviceCompare !== 0) return serviceCompare;
+                            const yearA_raw = a[this.columnNames.year];
+                            const yearB_raw = b[this.columnNames.year];
+                            const isValidYear = (val) => { const num = parseInt(val, 10); return !isNaN(num) && num >= 1900 && num <= 2100; };
+                            const aIsValid = isValidYear(yearA_raw);
+                            const bIsValid = isValidYear(yearB_raw);
+                            if (aIsValid && bIsValid) { return parseInt(yearB_raw, 10) - parseInt(yearA_raw, 10); }
+                            else if (aIsValid) { return -1; }
+                            else if (bIsValid) { return 1; }
+                            else { return String(yearA_raw).localeCompare(String(yearB_raw)); }
+                        });
+                    } else if (sortField) {
+                        dataToSort.sort((a, b) => {
+                            const valA = a[sortField];
+                            const valB = b[sortField];
+                            if (valA === null || valA === undefined || valB === null || valB === undefined) return 0;
+                            if (isNumericSort) {
+                                const numA = Number(valA);
+                                const numB = Number(valB);
+                                if (isNaN(numA) || isNaN(numB)) return 0;
+                                return isAscending ? numA - numB : numB - numA;
+                            } else { return String(valA).localeCompare(String(valB)); }
+                        });
+                    }
+                    const reportArray = dataToSort.map(rowData => allHeaders.map(h => rowData[h] ?? 0));
+                    if (reportArray.length > 0) {
+                        const dataRange = targetSheet.getRange(currentRow, 1, reportArray.length, allHeaders.length);
+                        dataRange.setValues(reportArray).setFontWeight("normal");
+                        const financialDataStartCol = primaryHeaders.length + 1;
+                        const yearColIndex = allHeaders.indexOf(this.columnNames.year);
+                        if (yearColIndex !== -1) {
+                            targetSheet.getRange(currentRow, yearColIndex + 1, reportArray.length, 1).setNumberFormat("0");
+                        }
+                        if (this.FINANCIAL_HEADERS.length > 0) {
+                            targetSheet.getRange(currentRow, financialDataStartCol, reportArray.length, this.FINANCIAL_HEADERS.length).setNumberFormat("#,##0.00");
+                        }
+                        currentRow += reportArray.length;
+                    }
+                }
+                currentRow += 2;
+            };
+            writeReportBlock("Summary by Service and Year", [this.columnNames.service, this.columnNames.year], dataForTab.reportByServiceYear, null);
+            writeReportBlock("Summary by Service and Property", [this.columnNames.service, this.columnNames.property], dataForTab.reportByServiceProperty, this.columnNames.property, false);
+            writeReportBlock("Summary by Service and Supplier/Payee", [this.columnNames.service, this.columnNames.supplier], dataForTab.reportByServiceSupplier, this.columnNames.supplier, false);
+            writeReportBlock("Summary by Service and Payor Company", [this.columnNames.service, this.columnNames.payor], dataForTab.reportByServicePayor, this.columnNames.payor, false);
+            Logger.log(`Report blocks appended to: ${targetSheet.getParent().getName()} -> ${targetSheet.getName()}`);
+        }
+    }
+    
+    _calculateRowsForBlock(dataForTab) {
+        let totalRows = 4;
+        const getBlockHeight = (dataObject) => 4 + (dataObject ? Object.keys(dataObject).length : 0);
+        totalRows += getBlockHeight(dataForTab.reportByServiceYear);
+        totalRows += getBlockHeight(dataForTab.reportByServiceProperty);
+        totalRows += getBlockHeight(dataForTab.reportByServiceSupplier);
+        totalRows += getBlockHeight(dataForTab.reportByServicePayor);
+        return totalRows;
+    }
+
+    _getOrCreateDestinationSheet(tabName, rowsToAdd) {
+        let localSheet = this.ss.getSheetByName(tabName);
+        if (!localSheet) {
+            Logger.log(`Creating new local sheet: "${tabName}"`);
+            return this.ss.insertSheet(tabName);
+        }
+        if (localSheet.getLastRow() + rowsToAdd < this.MAX_ROWS_PER_SHEET) {
+            return localSheet;
+        }
+
+        Logger.log(`Local sheet "${tabName}" is full. Attempting to find/create an archive.`);
+        try {
+            const folder = DriveApp.getFolderById(this.ARCHIVE_FOLDER_ID);
+            const filesIterator = folder.searchFiles(`title contains "${this.ARCHIVE_BASE_NAME}" and mimeType = '${MimeType.GOOGLE_SHEETS}'`);
+            const existingArchives = [];
+            while (filesIterator.hasNext()) existingArchives.push(filesIterator.next());
+
+            existingArchives.sort((a, b) => b.getDateCreated() - a.getDateCreated());
+
+            if (existingArchives.length > 0) {
+                const latestArchiveSS = SpreadsheetApp.openById(existingArchives[0].getId());
+                let sheet = latestArchiveSS.getSheetByName(tabName);
+                if (!sheet) sheet = latestArchiveSS.insertSheet(tabName);
+                if (sheet.getLastRow() + rowsToAdd < this.MAX_ROWS_PER_SHEET) {
+                    Logger.log(`Using existing archive: ${latestArchiveSS.getName()}`);
+                    return sheet;
+                }
+            }
+
+            // --- NEW: Dynamic File Naming and UI Alert Logic ---
+            const formattedDate = Utilities.formatDate(new Date(), this.ss.getSpreadsheetTimeZone(), "yyyy-MM-dd");
+            const partNumber = existingArchives.length + 1;
+            const newFileName = `${this.ARCHIVE_BASE_NAME} - Part ${partNumber} - ${formattedDate}`;
+
+            // Display a UI alert to the user before creating the file.
+            const alertMessage = `The sheet "${tabName}" has reached its limit. A new file named "${newFileName}" will be created in the archive folder.\n\nThe script will continue writing to this new file.`;
+            this.ui.alert("Sheet Full: New File Created!", alertMessage, this.ui.ButtonSet.OK);
+            
+            Logger.log(`Creating new archive spreadsheet: ${newFileName}`);
+            const newSS = SpreadsheetApp.create(newFileName);
+            
+            const newFile = DriveApp.getFileById(newSS.getId());
+            folder.addFile(newFile);
+            DriveApp.getRootFolder().removeFile(newFile);
+            
+            const newSheet = newSS.insertSheet(tabName);
+            // Remove the default "Sheet1" if it exists.
+            const defaultSheet = newSS.getSheetByName("Sheet1");
+            if (defaultSheet) newSS.deleteSheet(defaultSheet);
+
+            return newSheet;
+
+        } catch (e) {
+            const errorMessage = `Could not create or access archive. Error: ${e.message}`;
+            Logger.log(`CRITICAL ERROR during archiving: ${errorMessage}. Writing to local sheet "${tabName}" as a fallback.`);
+            this.ui.alert(`Archiving Failed`, `${errorMessage} Data will be written to local sheet "${tabName}" as a fallback.`, this.ui.ButtonSet.OK);
+            return localSheet;
+        }
+    }
+}
