@@ -1,4 +1,4 @@
-# PCU-Report-Automation - Google Sheets Data Consolidation and Reporting Scripts
+# Payables Custodianship Unit Data Consolidation and Reporting Scripts Automation
 
 This repository contains two Google Apps Scripts designed to automate the process of consolidating data from multiple Google Sheets and then generating aggregated summary reports from that consolidated data.
 
