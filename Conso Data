@@ -1,0 +1,241 @@
+// --- CONFIGURATION ---
+
+// The ID of the SPREADSHEET where the links to new files will be logged.
+const LOG_SPREADSHEET_ID = "1mqg-5THBoUXAT3Hxz1fgdUyx1QWKiuW2YvL8op4PnVI";
+
+// The name of the TAB in the LOG SPREADSHEET.
+const LOG_SHEET_NAME = "Extension Tab";
+
+// The name of the TAB in THIS spreadsheet for logging file access errors.
+const ISSUE_LOG_SHEET_NAME = "Issue";
+
+// The folder where new consolidated sheets will be created when the old one is full.
+const DESTINATION_FOLDER_ID = "1obQ4LmNQflZnDcxgQgG7I8tcUffNdDOJ";
+
+// The script will try to pause and save its state after this many minutes.
+const MAX_EXECUTION_TIME_MINUTES = 5;
+
+// The number of rows to accumulate in memory before writing them to the sheet.
+const BATCH_WRITE_SIZE = 1000;
+
+// The hard limit of cells in a Google Sheet.
+const GOOGLE_SHEET_CELL_LIMIT = 10000000; //10000000
+
+/**
+ * Adds a custom menu to the spreadsheet UI.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+      .createMenu('Consolidator')
+      .addItem('Start or Resume Consolidation', 'consolidateToMaxPerformance')
+      .addSeparator()
+      .addItem('Reset Consolidation Process', 'resetConsolidationProcess')
+      .addItem('Generate Report', 'uisadaaa')
+      .addToUi();
+
+}
+
+/**
+ * Creates a new spreadsheet for consolidation, logs it, and returns the new sheet object.
+ * @param {object} state The current script state object.
+ * @return {{newState: object, newSheet: Sheet}} An object containing the updated state and the new sheet object.
+ */
+function createNewConsolidationSheet(state) {
+  state.consolidationFilePart++;
+  const newFileName = `Consolidated Data - Part ${state.consolidationFilePart} - ${new Date().toISOString().slice(0,10)}`;
+  const newSpreadsheet = SpreadsheetApp.create(newFileName);
+  
+  DriveApp.getFileById(newSpreadsheet.getId()).moveTo(DriveApp.getFolderById(DESTINATION_FOLDER_ID));
+
+  const newConsoSheet = newSpreadsheet.getSheets()[0].setName("Conso");
+  newConsoSheet.appendRow(state.headers);
+  SpreadsheetApp.flush();
+  
+  const logSpreadsheet = SpreadsheetApp.openById(LOG_SPREADSHEET_ID);
+  const extensionSheet = logSpreadsheet.getSheetByName(LOG_SHEET_NAME);
+  extensionSheet.appendRow([newSpreadsheet.getName(), newSpreadsheet.getUrl()]);
+
+  state.currentConsoSheetId = newSpreadsheet.getId();
+  state.totalRowsWritten = 1; // Reset to 1 for the header row
+
+  SpreadsheetApp.getUi().alert('Sheet Full: New File Created!', `The sheet reached its limit. A new file named "${newFileName}" was created. The script will now continue writing to this new file.`, SpreadsheetApp.getUi().ButtonSet.OK);
+
+  return { newState: state, newSheet: newConsoSheet };
+}
+
+/**
+ * Main consolidation function that seamlessly continues to new sheets when limits are reached.
+ */
+function consolidateToMaxPerformance() {
+  const mainSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const scriptProperties = PropertiesService.getScriptProperties();
+
+  let state = JSON.parse(scriptProperties.getProperty('consolidationState'));
+
+  if (!state) {
+    // --- First-time setup ---
+    const response = ui.alert('Start New Consolidation?',
+      'This will clear the "Conso" sheet, the "Issue" log in this file, and the "Extension Tab" in the central log file.\n\n' +
+      'Do you want to begin?', ui.ButtonSet.YES_NO);
+
+    if (response !== ui.Button.YES) {
+      ui.alert('Operation cancelled.');
+      return;
+    }
+    
+    const sourceFileSheet = mainSpreadsheet.getSheetByName("SOURCEFILES");
+    const consoSheet = mainSpreadsheet.getSheetByName("Conso");
+    
+    let issueSheet = mainSpreadsheet.getSheetByName(ISSUE_LOG_SHEET_NAME);
+    if (!issueSheet) { issueSheet = mainSpreadsheet.insertSheet(ISSUE_LOG_SHEET_NAME); }
+    issueSheet.clear().appendRow(["File URL", "Error Message", "Timestamp"]);
+
+    try {
+      SpreadsheetApp.openById(LOG_SPREADSHEET_ID).getSheetByName(LOG_SHEET_NAME).clear().appendRow(["File Name", "File Link"]);
+    } catch (e) {
+      ui.alert(`Error accessing the Log Spreadsheet. Please check that the ID is correct and you have edit access. Error: ${e.message}`);
+      return;
+    }
+    
+    consoSheet.clear();
+    const columnsToGet = ["YEAR","MONTH","Property","PAYOR NAME","PAYEE NAME","Sector","KINDS OF SERVICE","CONTRACT NO","Contract Amount","INVOICE NO.","SOA AMOUNT","GENERAL STATUS"];
+    const headers = ["File Name", "Tab Name", ...columnsToGet];
+    consoSheet.appendRow(headers);
+    SpreadsheetApp.flush();
+
+    const sourceInfo = sourceFileSheet.getRange(2, 2, sourceFileSheet.getLastRow() - 1, 2).getValues().filter(row => row[0] && row[1]); 
+
+    state = {
+      sourceInfo: sourceInfo,
+      columnsToGet: columnsToGet,
+      headers: headers,
+      currentFileIndex: 0,
+      currentTabIndex: 0,
+      totalRowsWritten: 1,
+      maxPossibleRows: Math.floor(GOOGLE_SHEET_CELL_LIMIT / headers.length),
+      currentConsoSheetId: mainSpreadsheet.getId(),
+      consolidationFilePart: 1
+    };
+  } else {
+    ui.alert('Resuming Consolidation', `Resuming process from file #${state.currentFileIndex + 1}.`, ui.ButtonSet.OK);
+  }
+
+  // --- 2. MAIN PROCESSING LOOP ---
+  let consoSheet = SpreadsheetApp.openById(state.currentConsoSheetId).getSheetByName("Conso");
+  const startTime = new Date();
+  let dataBatch = [];
+
+  try {
+    for (let i = state.currentFileIndex; i < state.sourceInfo.length; i++) {
+      state.currentFileIndex = i;
+      const fileUrl = state.sourceInfo[i][1];
+      let sourceSpreadsheet;
+      
+      try {
+        sourceSpreadsheet = SpreadsheetApp.openById(extractIdFromUrl(fileUrl));
+      } catch (e) {
+        mainSpreadsheet.getSheetByName(ISSUE_LOG_SHEET_NAME).appendRow([fileUrl, e.message, new Date()]);
+        continue; // Skip to the next file
+      }
+
+      const fileName = sourceSpreadsheet.getName();
+      const tabNames = state.sourceInfo[i][0].split(',').map(name => name.trim());
+
+      for (let j = state.currentTabIndex; j < tabNames.length; j++) {
+        state.currentTabIndex = j;
+        
+        if ((new Date() - startTime) / 1000 / 60 > MAX_EXECUTION_TIME_MINUTES) throw new Error('Timeout');
+        
+        const tabName = tabNames[j];
+        const sourceSheet = sourceSpreadsheet.getSheetByName(tabName);
+        if (!sourceSheet) {
+          Logger.log(`SKIPPING TAB: "${tabName}" not found in file: ${fileName}`);
+          continue;
+        }
+
+        const allData = sourceSheet.getDataRange().getValues();
+        if (allData.length < 6) continue;
+
+        const sourceHeaders = allData[4].map(h => String(h).toLowerCase().trim());
+        const colIndices = state.columnsToGet.map(colName => sourceHeaders.indexOf(colName.toLowerCase().trim()));
+        
+        const dataRows = allData.slice(5);
+        for (const dataRow of dataRows) {
+          const newRow = colIndices.map(index => (index !== -1 ? dataRow[index] : ""));
+          if (newRow.join("").trim() !== "") {
+            dataBatch.push([fileName, tabName, ...newRow]);
+          }
+
+          if (dataBatch.length >= BATCH_WRITE_SIZE) {
+            if (state.totalRowsWritten + dataBatch.length >= state.maxPossibleRows) {
+              const result = createNewConsolidationSheet(state);
+              state = result.newState;
+              consoSheet = result.newSheet;
+            }
+            consoSheet.getRange(consoSheet.getLastRow() + 1, 1, dataBatch.length, state.headers.length).setValues(dataBatch);
+            state.totalRowsWritten += dataBatch.length;
+            dataBatch = [];
+          }
+        }
+      }
+      state.currentTabIndex = 0;
+    }
+
+    if (dataBatch.length > 0) {
+      if (state.totalRowsWritten + dataBatch.length >= state.maxPossibleRows) {
+        const result = createNewConsolidationSheet(state);
+        state = result.newState;
+        consoSheet = result.newSheet;
+      }
+      consoSheet.getRange(consoSheet.getLastRow() + 1, 1, dataBatch.length, state.headers.length).setValues(dataBatch);
+      state.totalRowsWritten += dataBatch.length;
+    }
+
+    ui.alert('Consolidation Complete!', `Successfully processed all source files.`, ui.ButtonSet.OK);
+    scriptProperties.deleteProperty('consolidationState');
+
+  } catch (e) {
+    scriptProperties.setProperty('consolidationState', JSON.stringify(state));
+
+    if (e.message === 'Timeout') {
+      ui.alert('Process Paused', 'The script has run for its allotted time and has saved its progress.\n\nPlease run the script again from the menu to continue.', ui.ButtonSet.OK);
+    } else {
+      ui.alert('An Error Occurred', `The script has stopped due to an error: ${e.message}\n\nYour progress has been saved. Please run the script again to resume.`, ui.ButtonSet.OK);
+      Logger.log(e);
+    }
+  }
+}
+
+/**
+ * Resets the consolidation process, clearing logs and saved state.
+ */
+function resetConsolidationProcess() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert('Confirm Reset', 'Are you sure you want to clear all saved progress and clear the "Conso", "Issue", and central "Extension Tab" sheets?', ui.ButtonSet.YES_NO);
+  
+  if (response === ui.Button.YES) {
+    PropertiesService.getScriptProperties().deleteProperty('consolidationState');
+    
+    const mainSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    mainSpreadsheet.getSheetByName("Conso")?.clear();
+    mainSpreadsheet.getSheetByName(ISSUE_LOG_SHEET_NAME)?.clear();
+    
+    try {
+        SpreadsheetApp.openById(LOG_SPREADSHEET_ID).getSheetByName(LOG_SHEET_NAME)?.clear();
+    } catch(e) {
+        ui.alert(`Could not clear the central log sheet. Please check permissions. Error: ${e.message}`);
+    }
+
+    ui.alert('Progress has been reset.');
+  }
+}
+
+/**
+ * Extracts the spreadsheet ID from a Google Sheets URL.
+ */
+function extractIdFromUrl(url) {
+  const regex = /\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/;
+  const match = url.match(regex);
+  return match ? match[1] : null;
+}
